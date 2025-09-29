@@ -12,7 +12,7 @@ export default async function handler(req, res) {
     const SHOP_DOMAIN = 'orne-decor-studio.myshopify.com';
     
     try {
-        const apiUrl = `https://${SHOP_DOMAIN}/admin/api/2024-01/orders.json?status=any&limit=10000`;
+        const apiUrl = `https://${SHOP_DOMAIN}/admin/api/2024-01/orders.json?status=any&limit=1000`;
         
         const response = await fetch(apiUrl, {
             headers: {

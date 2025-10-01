@@ -177,22 +177,54 @@ export default async function handler(req, res) {
         console.log('🚀 Iniciando busca de pedidos não entregues...');
         
         let allOrders = [];
-        let pageInfo = null;
-        let pageCount = 0;
-        const maxPages = 10; // Limitar a 2500 pedidos (10 * 250)
+    let currentPageInfo = null;
+    let pageCount = 0;
+    const maxPages = 10; // Limite de segurança
+    
+    do {
+        pageCount++;
+        console.log(`\n🔄 Buscando página ${pageCount}...`);
         
-        // Loop de paginação
-        do {
-            const { orders, nextPageInfo } = await fetchOrdersPage(pageInfo);
-            allOrders = allOrders.concat(orders);
-            pageInfo = nextPageInfo;
-            pageCount++;
-            
-            console.log(`📄 Página ${pageCount}: ${orders.length} pedidos encontrados`);
-            
-        } while (pageInfo && pageCount < maxPages);
+        const pageData = await fetchOrdersPage(currentPageInfo);
         
-        console.log(`📊 Total bruto: ${allOrders.length} pedidos`);
+        if (!pageData || !pageData.orders) {
+            console.log('❌ Nenhum dado retornado, finalizando busca');
+            break;
+        }
+        
+        console.log(`✅ Página ${pageCount}: ${pageData.orders.length} pedidos encontrados`);
+        
+        // Adicionar pedidos desta página ao total
+        allOrders = [...allOrders, ...pageData.orders];
+        console.log(`📊 Total acumulado: ${allOrders.length} pedidos`);
+        
+        // Verificar se há próxima página
+        currentPageInfo = pageData.nextPageInfo;
+        
+        if (!currentPageInfo) {
+            console.log('✅ Última página alcançada');
+        }
+        
+        // Proteção contra loop infinito
+        if (pageCount >= maxPages) {
+            console.log(`⚠️ Limite de ${maxPages} páginas atingido`);
+            break;
+        }
+        
+    } while (currentPageInfo);
+    
+    console.log(`\n🎯 BUSCA COMPLETA!`);
+    console.log(`📦 Total de pedidos encontrados: ${allOrders.length}`);
+    console.log(`📄 Total de páginas processadas: ${pageCount}`);
+    
+    // Retornar resposta com TODOS os pedidos
+    return res.status(200).json({
+        success: true,
+        orders: allOrders,
+        total: allOrders.length,
+        pages: pageCount,
+        message: `${allOrders.length} pedidos dos últimos 90 dias em ${pageCount} página(s)`
+    });
         
         // ============================
         // 5. FILTRAR PEDIDOS

@@ -1,6 +1,6 @@
-// shopify-proxy.js - VERSÃO OTIMIZADA
-// API para buscar apenas pedidos NÃO ENTREGUES dos últimos 90 dias
-// Com suporte a paginação, cache e filtros avançados
+// shopify-proxy.js - VERSÃO CORRIGIDA E OTIMIZADA
+// API para buscar pedidos e analisar prazos de entrega
+// Última atualização: Janeiro 2025
 
 export default async function handler(req, res) {
     // ============================
@@ -20,16 +20,28 @@ export default async function handler(req, res) {
     // ============================
     // 2. CONFIGURAÇÕES DA SHOPIFY
     // ============================
-    const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-    const SHOP_DOMAIN = 'orne-decor-studio.myshopify.com';
+    const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || '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';
+    const SHOP_DOMAIN = process.env.SHOP_DOMAIN || 'orne-decor-studio.myshopify.com';
     const API_VERSION = '2024-01';
+    const MAX_PAGES = parseInt(process.env.MAX_PAGES || '15'); // Aumentado para 15
+    const DAYS_TO_FETCH = parseInt(process.env.DAYS_TO_FETCH || '90');
+    
+    // Log de configuração (apenas em dev)
+    if (process.env.NODE_ENV !== 'production') {
+        console.log('🔧 Configurações:', {
+            shop: SHOP_DOMAIN,
+            maxPages: MAX_PAGES,
+            daysToFetch: DAYS_TO_FETCH,
+            hasToken: !!SHOPIFY_TOKEN
+        });
+    }
     
     // Verificar token
     if (!SHOPIFY_TOKEN) {
         console.error('❌ Token da Shopify não configurado');
         return res.status(500).json({
             success: false,
-            error: 'Token não configurado',
+            error: 'Token não configurado no servidor',
             orders: [],
             stats: {
                 total: 0,
@@ -46,27 +58,20 @@ export default async function handler(req, res) {
     
     // Verificar se pedido está entregue
     const isOrderDelivered = (order) => {
-        // Verificar múltiplas condições de entrega
-        
-        // 1. Status de fulfillment
-        if (order.fulfillment_status === 'fulfilled') {
-            // Verificar se TODOS os fulfillments estão entregues
-            if (order.fulfillments && order.fulfillments.length > 0) {
-                const hasDelivered = order.fulfillments.some(f => 
-                    f.shipment_status === 'delivered' || 
-                    f.status === 'delivered'
-                );
-                if (hasDelivered) return true;
-            }
+        // 1. Verificar fulfillments
+        if (order.fulfillments && order.fulfillments.length > 0) {
+            const hasDelivered = order.fulfillments.some(f => 
+                f.shipment_status === 'delivered' || 
+                f.status === 'delivered'
+            );
+            if (hasDelivered) return true;
         }
         
         // 2. Verificar tags
         if (order.tags) {
             const tagsLower = order.tags.toLowerCase();
-            if (tagsLower.includes('entregue') || 
-                tagsLower.includes('delivered') ||
-                tagsLower.includes('finalizado') ||
-                tagsLower.includes('concluido')) {
+            const deliveredTags = ['entregue', 'delivered', 'finalizado', 'concluido', 'completo'];
+            if (deliveredTags.some(tag => tagsLower.includes(tag))) {
                 return true;
             }
         }
@@ -74,64 +79,100 @@ export default async function handler(req, res) {
         // 3. Verificar nota do pedido
         if (order.note) {
             const noteLower = order.note.toLowerCase();
-            if (noteLower.includes('entregue') || 
-                noteLower.includes('delivered')) {
+            if (noteLower.includes('entregue') || noteLower.includes('delivered')) {
                 return true;
             }
         }
         
-        // 4. Se o pedido tem mais de 60 dias E está fulfilled, considerar entregue
-        const orderDate = new Date(order.created_at);
-        const daysPassed = Math.floor((Date.now() - orderDate) / (1000 * 60 * 60 * 24));
-        if (daysPassed > 60 && order.fulfillment_status === 'fulfilled') {
-            return true;
+        // 4. Se pedido tem mais de 60 dias E está fulfilled, presumir entregue
+        if (order.fulfillment_status === 'fulfilled') {
+            const orderDate = new Date(order.created_at);
+            const daysPassed = Math.floor((Date.now() - orderDate) / (1000 * 60 * 60 * 24));
+            if (daysPassed > 60) {
+                return true;
+            }
         }
         
         return false;
     };
     
-    // Filtrar pedidos válidos (não cancelados, não reembolsados, etc)
+    // Filtrar pedidos válidos
     const isValidOrder = (order) => {
+        // Validar que o pedido tem dados mínimos
+        if (!order || !order.id || !order.created_at) {
+            return false;
+        }
+        
         // Remover pedidos cancelados
-        if (order.cancelled_at) return false;
+        if (order.cancelled_at || order.cancel_reason) {
+            return false;
+        }
         
-        // Remover pedidos com problemas financeiros
-        const invalidFinancialStatus = [
-            'refunded',
-            'partially_refunded', 
-            'voided',
-            'pending',
-            null,
-            undefined
-        ];
-        
+        // Remover pedidos com status financeiro inválido
+        const invalidFinancialStatus = ['refunded', 'voided'];
         if (invalidFinancialStatus.includes(order.financial_status)) {
             return false;
         }
         
-        // Manter apenas pedidos pagos ou autorizados
-        const validFinancialStatus = ['paid', 'authorized', 'partially_paid'];
-        return validFinancialStatus.includes(order.financial_status);
+        // Aceitar parcialmente reembolsados se ainda tem valor
+        if (order.financial_status === 'partially_refunded') {
+            const totalPrice = parseFloat(order.total_price || 0);
+            const refundedAmount = parseFloat(order.total_refunds || 0);
+            if (refundedAmount >= totalPrice) {
+                return false;
+            }
+        }
+        
+        // Manter pedidos pendentes por até 7 dias
+        if (order.financial_status === 'pending') {
+            const orderDate = new Date(order.created_at);
+            const daysPassed = Math.floor((Date.now() - orderDate) / (1000 * 60 * 60 * 24));
+            if (daysPassed > 7) {
+                return false;
+            }
+        }
+        
+        return true;
+    };
+    
+    // Calcular nível de urgência
+    const calculateUrgencyLevel = (daysPassed, hasTracking) => {
+        if (!hasTracking) {
+            // Sem tracking - prazos mais curtos
+            if (daysPassed > 7) return 'critical';
+            if (daysPassed > 5) return 'high';
+            if (daysPassed > 3) return 'medium';
+            return 'normal';
+        } else {
+            // Com tracking - prazos padrão
+            if (daysPassed > 21) return 'critical';
+            if (daysPassed > 16) return 'high';
+            if (daysPassed > 13) return 'medium';
+            return 'normal';
+        }
     };
     
     // Buscar uma página de pedidos
     const fetchOrdersPage = async (pageInfo = null) => {
         try {
-            // Construir URL base
+            // Construir URL
             const hoje = new Date();
-            const dias90Atras = new Date(hoje.getTime() - (90 * 24 * 60 * 60 * 1000));
+            const diasAtras = new Date(hoje.getTime() - (DAYS_TO_FETCH * 24 * 60 * 60 * 1000));
             
             let apiUrl = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/orders.json`;
-            apiUrl += `?status=any&limit=250`;
-            apiUrl += `&created_at_min=${dias90Atras.toISOString()}`;
-            apiUrl += `&fields=id,name,created_at,customer,total_price,financial_status,fulfillment_status,fulfillments,tags,note,cancelled_at,tracking_numbers,line_items`;
             
-            // Adicionar page_info se for paginação
             if (pageInfo) {
-                apiUrl = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/orders.json?page_info=${pageInfo}&limit=250`;
+                // Paginação - usar page_info
+                apiUrl += `?page_info=${pageInfo}&limit=250`;
+            } else {
+                // Primeira página - usar filtros
+                apiUrl += `?status=any&limit=250`;
+                apiUrl += `&created_at_min=${diasAtras.toISOString()}`;
+                apiUrl += `&fields=id,name,created_at,updated_at,customer,total_price,`;
+                apiUrl += `financial_status,fulfillment_status,fulfillments,tags,note,`;
+                apiUrl += `cancelled_at,cancel_reason,total_refunds,tracking_numbers,`;
+                apiUrl += `line_items,shipping_lines,discount_codes`;
             }
-            
-            console.log(`📦 Buscando página de pedidos...`);
             
             const response = await fetch(apiUrl, {
                 method: 'GET',
@@ -142,6 +183,8 @@ export default async function handler(req, res) {
             });
             
             if (!response.ok) {
+                const errorText = await response.text();
+                console.error(`❌ Shopify API erro ${response.status}:`, errorText);
                 throw new Error(`Shopify API erro: ${response.status}`);
             }
             
@@ -150,9 +193,9 @@ export default async function handler(req, res) {
             let nextPageInfo = null;
             
             if (linkHeader) {
-                const matches = linkHeader.match(/<[^>]*page_info=([^>]*)>; rel="next"/);
+                const matches = linkHeader.match(/<[^>]*page_info=([^>&]*)[^>]*>; rel="next"/);
                 if (matches && matches[1]) {
-                    nextPageInfo = matches[1].split('&')[0];
+                    nextPageInfo = matches[1];
                 }
             }
             
@@ -164,7 +207,7 @@ export default async function handler(req, res) {
             };
             
         } catch (error) {
-            console.error('❌ Erro ao buscar página:', error);
+            console.error('❌ Erro ao buscar página:', error.message);
             throw error;
         }
     };
@@ -174,99 +217,102 @@ export default async function handler(req, res) {
     // ============================
     
     try {
-        console.log('🚀 Iniciando busca de pedidos não entregues...');
+        console.log(`🚀 Iniciando busca de pedidos dos últimos ${DAYS_TO_FETCH} dias...`);
         
         let allOrders = [];
-    let currentPageInfo = null;
-    let pageCount = 0;
-    const maxPages = 10; // Limite de segurança
-    
-    do {
-        pageCount++;
-        console.log(`\n🔄 Buscando página ${pageCount}...`);
+        let currentPageInfo = null;
+        let pageCount = 0;
         
-        const pageData = await fetchOrdersPage(currentPageInfo);
+        // Buscar todas as páginas
+        do {
+            pageCount++;
+            console.log(`📄 Buscando página ${pageCount}...`);
+            
+            const pageData = await fetchOrdersPage(currentPageInfo);
+            
+            if (!pageData || !pageData.orders || pageData.orders.length === 0) {
+                console.log('✅ Sem mais pedidos para buscar');
+                break;
+            }
+            
+            console.log(`✅ Página ${pageCount}: ${pageData.orders.length} pedidos`);
+            
+            // Adicionar pedidos ao total
+            allOrders = [...allOrders, ...pageData.orders];
+            
+            // Próxima página
+            currentPageInfo = pageData.nextPageInfo;
+            
+            // Proteção contra loop infinito
+            if (pageCount >= MAX_PAGES) {
+                console.log(`⚠️ Limite de ${MAX_PAGES} páginas atingido`);
+                break;
+            }
+            
+        } while (currentPageInfo);
         
-        if (!pageData || !pageData.orders) {
-            console.log('❌ Nenhum dado retornado, finalizando busca');
-            break;
-        }
-        
-        console.log(`✅ Página ${pageCount}: ${pageData.orders.length} pedidos encontrados`);
-        
-        // Adicionar pedidos desta página ao total
-        allOrders = [...allOrders, ...pageData.orders];
-        console.log(`📊 Total acumulado: ${allOrders.length} pedidos`);
-        
-        // Verificar se há próxima página
-        currentPageInfo = pageData.nextPageInfo;
-        
-        if (!currentPageInfo) {
-            console.log('✅ Última página alcançada');
-        }
-        
-        // Proteção contra loop infinito
-        if (pageCount >= maxPages) {
-            console.log(`⚠️ Limite de ${maxPages} páginas atingido`);
-            break;
-        }
-        
-    } while (currentPageInfo);
-    
-    console.log(`\n🎯 BUSCA COMPLETA!`);
-    console.log(`📦 Total de pedidos encontrados: ${allOrders.length}`);
-    console.log(`📄 Total de páginas processadas: ${pageCount}`);
-    
-    // Retornar resposta com TODOS os pedidos
-    return res.status(200).json({
-        success: true,
-        orders: allOrders,
-        total: allOrders.length,
-        pages: pageCount,
-        message: `${allOrders.length} pedidos dos últimos 90 dias em ${pageCount} página(s)`
-    });
+        console.log(`\n🎯 Busca completa: ${allOrders.length} pedidos em ${pageCount} páginas`);
         
         // ============================
-        // 5. FILTRAR PEDIDOS
+        // 5. FILTRAR E PROCESSAR PEDIDOS
         // ============================
+        
+        console.log('🔍 Iniciando filtragem e análise...');
         
         // Filtrar pedidos válidos
         const validOrders = allOrders.filter(isValidOrder);
-        console.log(`✅ Pedidos válidos: ${validOrders.length}`);
+        console.log(`✅ Pedidos válidos: ${validOrders.length} (${allOrders.length - validOrders.length} removidos)`);
         
-        // Separar entregues e não entregues
-        const deliveredOrders = validOrders.filter(isOrderDelivered);
-        const activeOrders = validOrders.filter(order => !isOrderDelivered(order));
+        // Separar entregues e ativos
+        const deliveredOrders = [];
+        const activeOrders = [];
+        
+        validOrders.forEach(order => {
+            if (isOrderDelivered(order)) {
+                deliveredOrders.push(order);
+            } else {
+                activeOrders.push(order);
+            }
+        });
         
         console.log(`📦 Pedidos ativos: ${activeOrders.length}`);
-        console.log(`✅ Pedidos entregues (removidos): ${deliveredOrders.length}`);
+        console.log(`✅ Pedidos entregues: ${deliveredOrders.length}`);
         
         // ============================
-        // 6. ADICIONAR ANÁLISE BÁSICA
+        // 6. ENRIQUECER PEDIDOS ATIVOS
         // ============================
         
-        // Enriquecer pedidos com informações adicionais
         const enrichedOrders = activeOrders.map(order => {
             const createdDate = new Date(order.created_at);
             const daysPassed = Math.floor((Date.now() - createdDate) / (1000 * 60 * 60 * 24));
             
-            // Coletar tracking numbers
-            let trackingNumbers = [];
+            // Coletar todos os tracking numbers
+            const trackingNumbers = [];
+            const trackingSet = new Set();
             
             // Do campo direto
-            if (order.tracking_numbers && order.tracking_numbers.length > 0) {
-                trackingNumbers = [...order.tracking_numbers];
+            if (order.tracking_numbers && Array.isArray(order.tracking_numbers)) {
+                order.tracking_numbers.forEach(tn => {
+                    if (tn && !trackingSet.has(tn)) {
+                        trackingSet.add(tn);
+                        trackingNumbers.push(tn);
+                    }
+                });
             }
             
             // Dos fulfillments
-            if (order.fulfillments) {
+            if (order.fulfillments && Array.isArray(order.fulfillments)) {
                 order.fulfillments.forEach(f => {
-                    if (f.tracking_number && !trackingNumbers.includes(f.tracking_number)) {
+                    // Tracking único
+                    if (f.tracking_number && !trackingSet.has(f.tracking_number)) {
+                        trackingSet.add(f.tracking_number);
                         trackingNumbers.push(f.tracking_number);
                     }
-                    if (f.tracking_numbers) {
+                    // Array de trackings
+                    if (f.tracking_numbers && Array.isArray(f.tracking_numbers)) {
                         f.tracking_numbers.forEach(tn => {
-                            if (tn && !trackingNumbers.includes(tn)) {
+                            if (tn && !trackingSet.has(tn)) {
+                                trackingSet.add(tn);
                                 trackingNumbers.push(tn);
                             }
                         });
@@ -274,36 +320,67 @@ export default async function handler(req, res) {
                 });
             }
             
-            // Determinar urgência
-            let urgencyLevel = 'normal';
-            if (daysPassed > 30) {
-                urgencyLevel = 'critical';
-            } else if (daysPassed > 20) {
-                urgencyLevel = 'high';
-            } else if (daysPassed > 15) {
-                urgencyLevel = 'medium';
+            const hasTracking = trackingNumbers.length > 0;
+            const urgencyLevel = calculateUrgencyLevel(daysPassed, hasTracking);
+            
+            // Determinar status de prazo
+            let prazoStatus = 'no_prazo';
+            if (!hasTracking) {
+                prazoStatus = daysPassed > 7 ? 'aguardando_urgente' : 'aguardando';
+            } else {
+                if (daysPassed > 20) prazoStatus = 'critico';
+                else if (daysPassed > 15) prazoStatus = 'atrasado';
+                else if (daysPassed > 12) prazoStatus = 'alerta';
+                else prazoStatus = 'no_prazo';
             }
             
             return {
                 ...order,
-                // Adicionar campos calculados
+                // Campos calculados
                 days_since_order: daysPassed,
                 urgency_level: urgencyLevel,
-                has_tracking: trackingNumbers.length > 0,
+                prazo_status: prazoStatus,
+                has_tracking: hasTracking,
                 all_tracking_numbers: trackingNumbers,
-                tracking_number: trackingNumbers.join(', ') || null
+                tracking_number: trackingNumbers.join(', ') || null,
+                is_late: daysPassed > (hasTracking ? 15 : 7),
+                // Análise compatível com o dashboard
+                analysis: {
+                    daysPassed: daysPassed,
+                    status: urgencyLevel === 'critical' ? 'critical' : 
+                            urgencyLevel === 'high' ? 'late' : 
+                            urgencyLevel === 'medium' ? 'warning' : 'normal',
+                    prazoStatus: prazoStatus,
+                    priority: urgencyLevel === 'critical' ? 10 :
+                             urgencyLevel === 'high' ? 8 :
+                             urgencyLevel === 'medium' ? 5 : 2,
+                    isLate: daysPassed > (hasTracking ? 15 : 7),
+                    isDelivered: false,
+                    hasTracking: hasTracking,
+                    trackingNumbers: trackingNumbers
+                }
             };
         });
         
-        // Ordenar por urgência (mais antigos primeiro)
-        enrichedOrders.sort((a, b) => b.days_since_order - a.days_since_order);
+        // Ordenar por urgência (mais críticos primeiro)
+        enrichedOrders.sort((a, b) => {
+            // Primeiro por urgência
+            const urgencyOrder = { critical: 4, high: 3, medium: 2, normal: 1 };
+            const urgencyDiff = urgencyOrder[b.urgency_level] - urgencyOrder[a.urgency_level];
+            if (urgencyDiff !== 0) return urgencyDiff;
+            
+            // Depois por dias
+            return b.days_since_order - a.days_since_order;
+        });
         
         // ============================
-        // 7. ESTATÍSTICAS
+        // 7. CALCULAR ESTATÍSTICAS
         // ============================
         
         const stats = {
+            // Totais
             total_fetched: allOrders.length,
+            total_invalid: allOrders.length - validOrders.length,
             valid_orders: validOrders.length,
             delivered_filtered: deliveredOrders.length,
             active_orders: activeOrders.length,
@@ -314,45 +391,72 @@ export default async function handler(req, res) {
             medium_priority: enrichedOrders.filter(o => o.urgency_level === 'medium').length,
             normal_priority: enrichedOrders.filter(o => o.urgency_level === 'normal').length,
             
-            // Por status
+            // Por tracking
             without_tracking: enrichedOrders.filter(o => !o.has_tracking).length,
             with_tracking: enrichedOrders.filter(o => o.has_tracking).length,
             
-            // Resumo temporal
+            // Por prazo
+            late_orders: enrichedOrders.filter(o => o.is_late).length,
+            on_time_orders: enrichedOrders.filter(o => !o.is_late).length,
+            
+            // Temporal
+            last_7_days: enrichedOrders.filter(o => o.days_since_order <= 7).length,
+            last_15_days: enrichedOrders.filter(o => o.days_since_order <= 15).length,
             last_30_days: enrichedOrders.filter(o => o.days_since_order <= 30).length,
-            last_60_days: enrichedOrders.filter(o => o.days_since_order <= 60).length,
-            over_60_days: enrichedOrders.filter(o => o.days_since_order > 60).length
+            over_30_days: enrichedOrders.filter(o => o.days_since_order > 30).length,
+            
+            // Percentuais
+            late_percentage: activeOrders.length > 0 ? 
+                ((enrichedOrders.filter(o => o.is_late).length / activeOrders.length) * 100).toFixed(1) : 0,
+            tracking_percentage: activeOrders.length > 0 ?
+                ((enrichedOrders.filter(o => o.has_tracking).length / activeOrders.length) * 100).toFixed(1) : 0
         };
         
-        console.log('📈 Estatísticas:', stats);
+        console.log('📊 Estatísticas calculadas:', stats);
         
         // ============================
-        // 8. RETORNAR RESPOSTA
+        // 8. RETORNAR RESPOSTA COMPLETA
         // ============================
         
-        return res.status(200).json({
+        const response = {
             success: true,
             orders: enrichedOrders,
             stats: stats,
-            message: `${activeOrders.length} pedidos ativos encontrados (${deliveredOrders.length} entregues filtrados)`,
-            generated_at: new Date().toISOString(),
-            cache_duration: 300 // 5 minutos
-        });
+            message: `${activeOrders.length} pedidos ativos analisados com sucesso`,
+            metadata: {
+                generated_at: new Date().toISOString(),
+                cache_duration: 300,
+                days_fetched: DAYS_TO_FETCH,
+                pages_processed: pageCount,
+                version: '2.0'
+            }
+        };
+        
+        console.log(`✅ Resposta pronta com ${enrichedOrders.length} pedidos processados`);
+        
+        return res.status(200).json(response);
         
     } catch (error) {
-        console.error('❌ ERRO GERAL:', error);
+        console.error('❌ ERRO GERAL:', error.message);
+        console.error(error.stack);
         
-        return res.status(200).json({
+        // Resposta de erro estruturada
+        return res.status(500).json({
             success: false,
             error: error.message,
             orders: [],
             stats: {
-                total: 0,
-                filtered: 0,
-                delivered: 0,
-                active: 0
+                total_fetched: 0,
+                valid_orders: 0,
+                delivered_filtered: 0,
+                active_orders: 0,
+                critical_orders: 0
             },
-            message: 'Erro ao processar pedidos'
+            message: `Erro ao processar pedidos: ${error.message}`,
+            metadata: {
+                generated_at: new Date().toISOString(),
+                version: '2.0'
+            }
         });
     }
 }

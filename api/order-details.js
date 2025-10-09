@@ -3,13 +3,18 @@
 // Última atualização: Janeiro 2025
 
 export default async function handler(req, res) {
+        console.log('🔵 Requisição recebida:', {
+        method: req.method,
+        query: req.query,
+        headers: req.headers.origin
+    });
     // ============================
     // 1. CONFIGURAÇÃO DE CORS
     // ============================
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+// Configuração de CORS mais permissiva temporariamente
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
     
     // Cache por 1 minuto (detalhes mudam com mais frequência)
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
